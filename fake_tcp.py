@@ -41,16 +41,10 @@ class FakeTcpInjector(TcpInjector):
             packet.tcp.payload = connection.fake_data
             if packet.ipv4:
                 packet.ipv4.ident = (packet.ipv4.ident + 1) & 0xffff
-            # if connection.bypass_method == "wrong_checksum":
-            #     ...
             if connection.bypass_method == "wrong_seq":
                 packet.tcp.seq_num = (connection.syn_seq + 1 - len(packet.tcp.payload)) & 0xffffffff
                 connection.fake_sent = True
                 self.w.send(packet, True)
-
-
-
-
             else:
                 sys.exit("not implemented method!")
 

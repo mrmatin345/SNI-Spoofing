@@ -46,7 +46,8 @@ class ClientHelloMaker:
 
     @classmethod
     def parse_client_response(cls, client_response_bytes: bytes):
-        assert len(client_response_bytes) >= 32
+        # Header = change_cipher (6) + app_data_header (3) + length (2) = 11 bytes.
+        assert len(client_response_bytes) >= 11
         app_data1 = client_response_bytes[11:]
         assert cls.get_client_response_with(app_data1) == client_response_bytes
         return app_data1

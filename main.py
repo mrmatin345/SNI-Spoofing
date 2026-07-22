@@ -51,8 +51,9 @@ def load_config(path):
         sys.exit("FAKE_SNI must be a non-empty string.")
     # The ClientHello template has a fixed size; the SNI shares a 219-byte
     # budget with the trailing padding extension (see packet_templates.py).
-    if len(fake_sni.encode()) > 219:
-        sys.exit("FAKE_SNI is too long (max 219 bytes), got: " + str(len(fake_sni.encode())))
+    fake_sni_len = len(fake_sni.encode())
+    if fake_sni_len > 219:
+        sys.exit("FAKE_SNI is too long (max 219 bytes), got: " + str(fake_sni_len))
 
     return cfg
 
@@ -102,17 +103,13 @@ def _drop_connection(conn: FakeInjectiveConnection):
     fake_injective_connections.pop(conn.id, None)
 
 
-async def relay_main_loop(sock_1: socket.socket, sock_2: socket.socket, peer_task: asyncio.Task,
-                          first_prefix_data: bytes):
+async def relay_main_loop(sock_1: socket.socket, sock_2: socket.socket, peer_task: asyncio.Task):
     loop = asyncio.get_running_loop()
     while True:
         try:
             data = await loop.sock_recv(sock_1, RECV_BUFFER_SIZE)
             if not data:
                 raise ValueError("eof")
-            if first_prefix_data:
-                data = first_prefix_data + data
-                first_prefix_data = b""
             # sock_sendall() sends the whole buffer or raises; it returns None.
             await loop.sock_sendall(sock_2, data)
         except Exception:
@@ -170,8 +167,8 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
         _drop_connection(fake_injective_conn)
 
         oti_task = asyncio.create_task(
-            relay_main_loop(outgoing_sock, incoming_sock, asyncio.current_task(), b""))
-        await relay_main_loop(incoming_sock, outgoing_sock, oti_task, b"")
+            relay_main_loop(outgoing_sock, incoming_sock, asyncio.current_task()))
+        await relay_main_loop(incoming_sock, outgoing_sock, oti_task)
 
     except asyncio.CancelledError:
         # Normal teardown when the peer relay direction closes first.
@@ -190,7 +187,14 @@ async def main():
     mother_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     mother_sock.setblocking(False)
     mother_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    mother_sock.bind((LISTEN_HOST, LISTEN_PORT))
+    try:
+        mother_sock.bind((LISTEN_HOST, LISTEN_PORT))
+    except OSError as e:
+        mother_sock.close()
+        sys.exit(
+            "Could not bind to " + LISTEN_HOST + ":" + str(LISTEN_PORT)
+            + " (" + str(e) + "). Is the port already in use or the address invalid?"
+        )
     set_tcp_keepalive(mother_sock)
     mother_sock.listen()
     loop = asyncio.get_running_loop()
@@ -208,10 +212,15 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Only divert the proxy's own flows to CONNECT_IP:CONNECT_PORT. Constraining
+    # the capture to the destination port keeps WinDivert from intercepting (and
+    # having to re-inject) unrelated TCP traffic to the same host.
     w_filter = ("tcp and ("
-                "(ip.SrcAddr == " + INTERFACE_IPV4 + " and ip.DstAddr == " + CONNECT_IP + ")"
+                "(ip.SrcAddr == " + INTERFACE_IPV4 + " and ip.DstAddr == " + CONNECT_IP
+                + " and tcp.DstPort == " + str(CONNECT_PORT) + ")"
                 " or "
-                "(ip.SrcAddr == " + CONNECT_IP + " and ip.DstAddr == " + INTERFACE_IPV4 + ")"
+                "(ip.SrcAddr == " + CONNECT_IP + " and ip.DstAddr == " + INTERFACE_IPV4
+                + " and tcp.SrcPort == " + str(CONNECT_PORT) + ")"
                 ")")
     fake_tcp_injector = FakeTcpInjector(w_filter, fake_injective_connections)
     threading.Thread(target=fake_tcp_injector.run, args=(), daemon=True).start()

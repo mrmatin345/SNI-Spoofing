@@ -11,6 +11,10 @@ from utils.network_tools import get_default_interface_ipv4
 from utils.packet_templates import ClientHelloMaker
 from fake_tcp import FakeInjectiveConnection, FakeTcpInjector
 
+# Buffer size used for socket reads. Slightly above the 65535 max TCP payload
+# so a full segment plus a little slack always fits in one recv.
+RECV_BUFFER_SIZE = 65575
+
 
 def get_exe_dir():
     """Returns the directory where the .exe (or script) is located."""
@@ -22,12 +26,56 @@ def get_exe_dir():
         return os.path.dirname(os.path.abspath(__file__))
 
 
-# Build the path to config.json
-config_path = os.path.join(get_exe_dir(), 'config.json')
+def load_config(path):
+    """Load and validate config.json, exiting with a clear message on error."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        sys.exit("config.json not found at: " + path)
+    except json.JSONDecodeError as e:
+        sys.exit("config.json is not valid JSON: " + str(e))
 
-# Load the config
-with open(config_path, 'r') as f:
-    config = json.load(f)
+    required = ("LISTEN_HOST", "LISTEN_PORT", "CONNECT_IP", "CONNECT_PORT", "FAKE_SNI")
+    missing = [k for k in required if k not in cfg]
+    if missing:
+        sys.exit("config.json is missing required keys: " + ", ".join(missing))
+
+    for port_key in ("LISTEN_PORT", "CONNECT_PORT"):
+        port = cfg[port_key]
+        if not isinstance(port, int) or not (0 < port < 65536):
+            sys.exit(port_key + " must be an integer between 1 and 65535, got: " + repr(port))
+
+    fake_sni = cfg["FAKE_SNI"]
+    if not isinstance(fake_sni, str) or not fake_sni:
+        sys.exit("FAKE_SNI must be a non-empty string.")
+    # The ClientHello template has a fixed size; the SNI shares a 219-byte
+    # budget with the trailing padding extension (see packet_templates.py).
+    if len(fake_sni.encode()) > 219:
+        sys.exit("FAKE_SNI is too long (max 219 bytes), got: " + str(len(fake_sni.encode())))
+
+    return cfg
+
+
+def set_tcp_keepalive(sock: socket.socket):
+    """Enable TCP keep-alive, guarding options that are not available on every
+    platform/Python build (TCP_KEEPIDLE/INTVL/CNT have limited Windows support)."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for opt_name, value in (("TCP_KEEPIDLE", 11), ("TCP_KEEPINTVL", 2), ("TCP_KEEPCNT", 3)):
+        opt = getattr(socket, opt_name, None)
+        if opt is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+        except (OSError, AttributeError):
+            # Option not supported on this platform; keep-alive still works
+            # with the OS defaults.
+            pass
+
+
+# Build the path to config.json and load it
+config_path = os.path.join(get_exe_dir(), 'config.json')
+config = load_config(config_path)
 
 LISTEN_HOST = config["LISTEN_HOST"]
 LISTEN_PORT = config["LISTEN_PORT"]
@@ -35,6 +83,11 @@ FAKE_SNI = config["FAKE_SNI"].encode()
 CONNECT_IP = config["CONNECT_IP"]
 CONNECT_PORT = config["CONNECT_PORT"]
 INTERFACE_IPV4 = get_default_interface_ipv4(CONNECT_IP)
+if not INTERFACE_IPV4:
+    sys.exit(
+        "Could not determine the local IPv4 interface used to reach "
+        + CONNECT_IP + ". Check your network connection and CONNECT_IP in config.json."
+    )
 DATA_MODE = "tls"
 BYPASS_METHOD = "wrong_seq"
 
@@ -43,85 +96,38 @@ BYPASS_METHOD = "wrong_seq"
 fake_injective_connections: dict[tuple, FakeInjectiveConnection] = {}
 
 
+def _drop_connection(conn: FakeInjectiveConnection):
+    """Stop monitoring a connection and remove it from the registry (idempotent)."""
+    conn.monitor = False
+    fake_injective_connections.pop(conn.id, None)
+
+
 async def relay_main_loop(sock_1: socket.socket, sock_2: socket.socket, peer_task: asyncio.Task,
                           first_prefix_data: bytes):
-    try:
-        loop = asyncio.get_running_loop()
-        while True:
-            try:
-                data = await loop.sock_recv(sock_1, 65575)
-                if not data:
-                    raise ValueError("eof")
-                if first_prefix_data:
-                    data = first_prefix_data + data
-                    first_prefix_data = b""
-                sent_len = await loop.sock_sendall(sock_2, data)
-                if sent_len != len(data):
-                    raise ValueError("incomplete send")
-            except Exception:
-                sock_1.close()
-                sock_2.close()
-                peer_task.cancel()
-                return
-    except Exception:
-        traceback.print_exc()
-        sys.exit("relay main loop error!")
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            data = await loop.sock_recv(sock_1, RECV_BUFFER_SIZE)
+            if not data:
+                raise ValueError("eof")
+            if first_prefix_data:
+                data = first_prefix_data + data
+                first_prefix_data = b""
+            # sock_sendall() sends the whole buffer or raises; it returns None.
+            await loop.sock_sendall(sock_2, data)
+        except Exception:
+            sock_1.close()
+            sock_2.close()
+            peer_task.cancel()
+            return
 
 
 async def handle(incoming_sock: socket.socket, incoming_remote_addr):
+    outgoing_sock = None
+    fake_injective_conn = None
     try:
         loop = asyncio.get_running_loop()
-        # try:
-        #     data = await loop.sock_recv(incoming_sock, 65575)
-        #     if not data:
-        #         raise ValueError("eof")
-        # except Exception:
-        #     incoming_sock.close()
-        #     return
-        # try:
-        #     version, uuid_bytes, transport_protocol, remote_address_type, remote_address, remote_port, payload_index = parse_vless_protocol(
-        #         data)
-        # except Exception as e:
-        #     print("No Vless Request!, Connection Closed", repr(e), data)
-        #     incoming_sock.close()
-        #     return
-        # if transport_protocol != "tcp":
-        #     print("Transport Protocol Error!, Connection Closed", transport_protocol, data)
-        #     incoming_sock.close()
-        #     return
-        # if remote_address_type == "hostname":
-        #     print("hostname address not implemented yet!", data)
-        #     incoming_sock.close()
-        #     return
-        # if remote_address_type == "ipv4":
-        #     if not INTERFACE_IPV4:
-        #         print("no interface ipv4!", data)
-        #         incoming_sock.close()
-        #         return
-        #     family = socket.AF_INET
-        #     src_ip = INTERFACE_IPV4
-        #
-        # elif remote_address_type == "ipv6":
-        #     if not INTERFACE_IPV6:
-        #         print("no interface ipv6!", data)
-        #         incoming_sock.close()
-        #         return
-        #     family = socket.AF_INET6
-        #     src_ip = INTERFACE_IPV6
-        #
-        # else:
-        #     print(data)
-        #     sys.exit("impossible address type!")
 
-        # try:
-        #     fake_sni_host, data_mode, bypass_method = UUID_FAKE_MAP[uuid_bytes]
-        # except KeyError:
-        #     print("unmatched uuid", uuid_bytes)
-        #     incoming_sock.close()
-        #     return
-
-        # if data_mode == "http":
-        #     ...
         if DATA_MODE == "tls":
             fake_data = ClientHelloMaker.get_client_hello_with(os.urandom(32), os.urandom(32), FAKE_SNI,
                                                                os.urandom(32))
@@ -130,10 +136,7 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
         outgoing_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         outgoing_sock.setblocking(False)
         outgoing_sock.bind((INTERFACE_IPV4, 0))
-        outgoing_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        outgoing_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 11)
-        outgoing_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
-        outgoing_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        set_tcp_keepalive(outgoing_sock)
         src_port = outgoing_sock.getsockname()[1]
         fake_injective_conn = FakeInjectiveConnection(outgoing_sock, INTERFACE_IPV4, CONNECT_IP, src_port, CONNECT_PORT,
                                                       fake_data,
@@ -142,14 +145,10 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
         try:
             await loop.sock_connect(outgoing_sock, (CONNECT_IP, CONNECT_PORT))
         except Exception:
-            fake_injective_conn.monitor = False
-            del fake_injective_connections[fake_injective_conn.id]
+            _drop_connection(fake_injective_conn)
             outgoing_sock.close()
             incoming_sock.close()
             return
-
-        # if bypass_method == "wrong_checksum":
-        #     ...
 
         if BYPASS_METHOD == "wrong_seq":
             try:
@@ -161,37 +160,30 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
                 else:
                     sys.exit("impossible t2a msg!")
             except Exception:
-                fake_injective_conn.monitor = False
-                del fake_injective_connections[fake_injective_conn.id]
+                _drop_connection(fake_injective_conn)
                 outgoing_sock.close()
                 incoming_sock.close()
                 return
         else:
             sys.exit("unknown bypass method!")
 
-        fake_injective_conn.monitor = False
-        del fake_injective_connections[fake_injective_conn.id]
-
-        # early_data = data[payload_index:]
-        # if early_data:
-        #     try:
-        #         sent_len = await loop.sock_sendall(outgoing_sock, early_data)
-        #         if sent_len != len(early_data):
-        #             raise ValueError("incomplete send")
-        #     except Exception:
-        #         outgoing_sock.close()
-        #         incoming_sock.close()
-        #         return
+        _drop_connection(fake_injective_conn)
 
         oti_task = asyncio.create_task(
-            relay_main_loop(outgoing_sock, incoming_sock, asyncio.current_task(), b""))  # bytes([version, 0])
+            relay_main_loop(outgoing_sock, incoming_sock, asyncio.current_task(), b""))
         await relay_main_loop(incoming_sock, outgoing_sock, oti_task, b"")
 
-
-
+    except asyncio.CancelledError:
+        # Normal teardown when the peer relay direction closes first.
+        raise
     except Exception:
         traceback.print_exc()
-        sys.exit("handle should not raise exception")
+        # A single connection failing must not take down the whole proxy.
+        if fake_injective_conn is not None:
+            _drop_connection(fake_injective_conn)
+        if outgoing_sock is not None:
+            outgoing_sock.close()
+        incoming_sock.close()
 
 
 async def main():
@@ -199,30 +191,36 @@ async def main():
     mother_sock.setblocking(False)
     mother_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     mother_sock.bind((LISTEN_HOST, LISTEN_PORT))
-    mother_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    mother_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 11)
-    mother_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
-    mother_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    set_tcp_keepalive(mother_sock)
     mother_sock.listen()
     loop = asyncio.get_running_loop()
-    while True:
-        incoming_sock, addr = await loop.sock_accept(mother_sock)
-        incoming_sock.setblocking(False)
-        incoming_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        incoming_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 11)
-        incoming_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
-        incoming_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-        asyncio.create_task(handle(incoming_sock, addr))
+    print("Listening on " + LISTEN_HOST + ":" + str(LISTEN_PORT)
+          + " -> " + CONNECT_IP + ":" + str(CONNECT_PORT)
+          + " (fake SNI: " + FAKE_SNI.decode() + ", via " + INTERFACE_IPV4 + ")")
+    try:
+        while True:
+            incoming_sock, addr = await loop.sock_accept(mother_sock)
+            incoming_sock.setblocking(False)
+            set_tcp_keepalive(incoming_sock)
+            asyncio.create_task(handle(incoming_sock, addr))
+    finally:
+        mother_sock.close()
 
 
 if __name__ == "__main__":
-    w_filter = "tcp and " + "(" + "(ip.SrcAddr == " + INTERFACE_IPV4 + " and ip.DstAddr == " + CONNECT_IP + ")" + " or " + "(ip.SrcAddr == " + CONNECT_IP + " and ip.DstAddr == " + INTERFACE_IPV4 + ")" + ")"
+    w_filter = ("tcp and ("
+                "(ip.SrcAddr == " + INTERFACE_IPV4 + " and ip.DstAddr == " + CONNECT_IP + ")"
+                " or "
+                "(ip.SrcAddr == " + CONNECT_IP + " and ip.DstAddr == " + INTERFACE_IPV4 + ")"
+                ")")
     fake_tcp_injector = FakeTcpInjector(w_filter, fake_injective_connections)
     threading.Thread(target=fake_tcp_injector.run, args=(), daemon=True).start()
-    print("هشن شومافر تیامح دینکیم هدافتسا دازآ تنرتنیا هب یسرتسد یارب همانرب نیا زا رگا")
-    print(
-        "دراد امش تیامح هب زاین هک مراد رظن رد دازآ تنرتنیا هب ناریا مدرم مامت یسرتسد یارب یدایز یاه همانرب و اه هژورپ")
+    print("اگر از این برنامه برای دسترسی به اینترنت آزاد استفاده می‌کنید، حمایت فراموش نشه")
+    print("پروژه‌ها و برنامه‌های زیادی برای دسترسی تمام مردم ایران به اینترنت آزاد در نظر دارم که به حمایت شما نیاز دارد")
     print("\n")
     print("USDT (BEP20): 0x76a768B53Ca77B43086946315f0BDF21156bF424\n")
     print("@patterniha")
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nShutting down.")

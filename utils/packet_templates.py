@@ -17,6 +17,10 @@ class ClientHelloMaker:
     @classmethod
     def get_client_hello_with(cls, rnd: bytes, sess_id: bytes, target_sni: bytes,
                               key_share: bytes) -> bytes:  # rnd,sess_id,key_share: 32 bytes
+        # The SNI and the trailing padding extension share a fixed 219-byte
+        # budget so the ClientHello stays exactly 517 bytes.
+        if len(target_sni) > 219:
+            raise ValueError("target_sni too long (max 219 bytes): " + str(len(target_sni)))
         server_name_ext = struct.pack("!H", len(target_sni) + 5) + struct.pack("!H",
                                                                                len(target_sni) + 3) + b"\x00" + struct.pack(
             "!H", len(target_sni)) + target_sni
@@ -29,11 +33,12 @@ class ClientHelloMaker:
         assert len(client_hello_bytes) == 517
         rnd = client_hello_bytes[11:43]
         sess_id = client_hello_bytes[44:76]
-        tls_sni = client_hello_bytes[127:127 + (struct.unpack("!H", client_hello_bytes[125:127])[0])].decode()
+        sni_len = struct.unpack("!H", client_hello_bytes[125:127])[0]
+        tls_sni = client_hello_bytes[127:127 + sni_len]  # keep as bytes for the round-trip check
         ks_ind = 262 + len(tls_sni)
         key_share = client_hello_bytes[ks_ind:ks_ind + 32]
         assert cls.get_client_hello_with(rnd, sess_id, tls_sni, key_share) == client_hello_bytes
-        return rnd, sess_id, tls_sni, key_share
+        return rnd, sess_id, tls_sni.decode(), key_share
 
     @classmethod
     def get_client_response_with(cls, app_data1: bytes):

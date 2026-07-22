@@ -20,7 +20,7 @@ The tool runs a local TCP proxy. For each incoming connection it:
 
 - **Windows** (WinDivert is Windows-only) with administrator privileges.
 - **Python 3.9+**.
-- `pydivert>=3.1.0` (installs the bundled WinDivert driver).
+- `pydivert>=2.1.0` (installs the bundled WinDivert driver).
 
 ```bash
 pip install -r requirements.txt

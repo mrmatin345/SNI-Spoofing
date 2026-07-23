@@ -8,6 +8,7 @@ from pydivert import Packet
 
 from monitor_connection import MonitorConnection
 from injecter import TcpInjector
+from utils.console import ui
 
 
 class FakeInjectiveConnection(MonitorConnection):
@@ -49,7 +50,9 @@ class FakeTcpInjector(TcpInjector):
                 sys.exit("not implemented method!")
 
     def on_unexpected_packet(self, packet: Packet, connection: FakeInjectiveConnection, info_m: str):
-        print(info_m, packet)
+        # Presentation only: report the interruption meaningfully instead of
+        # dumping the raw packet object. The teardown logic below is unchanged.
+        ui.handshake_failed(dest=(connection.dst_ip, connection.dst_port), reason=info_m)
         connection.sock.close()
         connection.peer_sock.close()
         connection.monitor = False

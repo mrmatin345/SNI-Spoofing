@@ -9,6 +9,7 @@ import json
 # from utils.proxy_protocols import parse_vless_protocol
 from utils.network_tools import get_default_interface_ipv4
 from utils.packet_templates import ClientHelloMaker
+from utils.console import ui
 from fake_tcp import FakeInjectiveConnection, FakeTcpInjector
 
 # Buffer size used for socket reads. Slightly above the 65535 max TCP payload
@@ -141,7 +142,8 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
         fake_injective_connections[fake_injective_conn.id] = fake_injective_conn
         try:
             await loop.sock_connect(outgoing_sock, (CONNECT_IP, CONNECT_PORT))
-        except Exception:
+        except Exception as e:
+            ui.connect_failed((CONNECT_IP, CONNECT_PORT), error=str(e))
             _drop_connection(fake_injective_conn)
             outgoing_sock.close()
             incoming_sock.close()
@@ -157,6 +159,13 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
                 else:
                     sys.exit("impossible t2a msg!")
             except Exception:
+                # Packet-level anomalies are already reported by the injector
+                # (see FakeTcpInjector.on_unexpected_packet). Only the silent
+                # timeout case needs to be surfaced here, so we don't log twice.
+                if fake_injective_conn.t2a_msg != "unexpected_close":
+                    ui.handshake_failed(
+                        dest=(CONNECT_IP, CONNECT_PORT), reason="no response (timeout)"
+                    )
                 _drop_connection(fake_injective_conn)
                 outgoing_sock.close()
                 incoming_sock.close()
@@ -166,16 +175,25 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
 
         _drop_connection(fake_injective_conn)
 
-        oti_task = asyncio.create_task(
-            relay_main_loop(outgoing_sock, incoming_sock, asyncio.current_task()))
-        await relay_main_loop(incoming_sock, outgoing_sock, oti_task)
+        ui.tunnel_up(incoming_remote_addr, (CONNECT_IP, CONNECT_PORT))
+        try:
+            oti_task = asyncio.create_task(
+                relay_main_loop(outgoing_sock, incoming_sock, asyncio.current_task()))
+            await relay_main_loop(incoming_sock, outgoing_sock, oti_task)
+        finally:
+            ui.tunnel_down(incoming_remote_addr, (CONNECT_IP, CONNECT_PORT))
 
     except asyncio.CancelledError:
         # Normal teardown when the peer relay direction closes first.
         raise
     except Exception:
-        traceback.print_exc()
         # A single connection failing must not take down the whole proxy.
+        # Keep the console clean: a concise line by default, full traceback
+        # only when SNI_DEBUG=1 is set.
+        if os.environ.get("SNI_DEBUG", "").strip().lower() in ("1", "true", "yes", "on"):
+            traceback.print_exc()
+        else:
+            ui.error("connection error", detail="run with SNI_DEBUG=1 for details")
         if fake_injective_conn is not None:
             _drop_connection(fake_injective_conn)
         if outgoing_sock is not None:
@@ -198,9 +216,10 @@ async def main():
     set_tcp_keepalive(mother_sock)
     mother_sock.listen()
     loop = asyncio.get_running_loop()
-    print("Listening on " + LISTEN_HOST + ":" + str(LISTEN_PORT)
-          + " -> " + CONNECT_IP + ":" + str(CONNECT_PORT)
-          + " (fake SNI: " + FAKE_SNI.decode() + ", via " + INTERFACE_IPV4 + ")")
+    ui.online(
+        LISTEN_HOST, LISTEN_PORT, CONNECT_IP, CONNECT_PORT,
+        FAKE_SNI.decode(), INTERFACE_IPV4, BYPASS_METHOD, DATA_MODE,
+    )
     try:
         while True:
             incoming_sock, addr = await loop.sock_accept(mother_sock)
@@ -222,14 +241,11 @@ if __name__ == "__main__":
                 "(ip.SrcAddr == " + CONNECT_IP + " and ip.DstAddr == " + INTERFACE_IPV4
                 + " and tcp.SrcPort == " + str(CONNECT_PORT) + ")"
                 ")")
+    ui.banner()
     fake_tcp_injector = FakeTcpInjector(w_filter, fake_injective_connections)
     threading.Thread(target=fake_tcp_injector.run, args=(), daemon=True).start()
-    print("اگر از این برنامه برای دسترسی به اینترنت آزاد استفاده می‌کنید، حمایت فراموش نشه")
-    print("پروژه‌ها و برنامه‌های زیادی برای دسترسی تمام مردم ایران به اینترنت آزاد در نظر دارم که به حمایت شما نیاز دارد")
-    print("\n")
-    print("USDT (BEP20): 0x76a768B53Ca77B43086946315f0BDF21156bF424\n")
-    print("@patterniha")
+    ui.support()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nShutting down.")
+        ui.shutdown()

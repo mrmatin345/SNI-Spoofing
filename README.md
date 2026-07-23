@@ -46,10 +46,28 @@ Run **as administrator** (WinDivert needs it):
 python main.py
 ```
 
-Then point your client at `LISTEN_HOST:LISTEN_PORT`. The proxy prints the
-active listen/connect configuration on startup.
+Then point your client at `LISTEN_HOST:LISTEN_PORT`. On startup the proxy shows
+a banner and a panel with the active configuration, then a live status line.
 
-Stop with `Ctrl+C`.
+Stop with `Ctrl+C` — you'll get a short session summary (uptime, tunnels
+served, peak concurrency, interrupted handshakes).
+
+## Console output
+
+The console is designed to stay calm and readable while the proxy runs:
+
+- **Tunnels** are logged the moment they're established, with the client, the
+  destination and live/total counts.
+- **Failures** (an unreachable destination, or a handshake the DPI/peer
+  interrupted) are summarized rather than dumped. Occasional interrupted
+  handshakes are normal on hostile networks — the client just retries.
+- **Debug mode**: set the `SNI_DEBUG` environment variable to see every
+  per-connection anomaly (with the raw reason) and full tracebacks:
+
+  ```bash
+  # Windows (PowerShell), run as administrator
+  $env:SNI_DEBUG=1; python main.py
+  ```
 
 ## Notes
 

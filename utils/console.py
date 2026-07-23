@@ -257,12 +257,13 @@ class _UI:
             self._out(
                 "If this tool helps you reach the free internet, please consider "
                 "supporting the project.\nUSDT (BEP20): "
-                "0x76a768B53Ca77B43086946315f0BDF21156bF424\n@patterniha\n"
+                "0x76a768B53Ca77B43086946315f0BDF21156bF424\n"
+                "Telegram: @patterniha  ·  @projectXhttp\n"
             )
             return
         body = Text()
-        body.append("اگر از این برنامه برای دسترسی به اینترنت آزاد استفاده می‌کنید، حمایت فراموش نشه.\n", style="value")
-        body.append("پروژه‌های زیادی برای دسترسی آزاد همه‌ی مردم ایران در راه است و به حمایت شما نیاز دارد.\n\n", style="muted")
+        body.append("If this tool helps you reach the free internet, please consider supporting it.\n", style="value")
+        body.append("More free-internet projects are on the way and need your support.\n\n", style="muted")
         body.append("USDT (BEP20)  ", style="muted")
         body.append("0x76a768B53Ca77B43086946315f0BDF21156bF424\n", style="accent")
         body.append("Telegram      ", style="muted")
@@ -272,7 +273,7 @@ class _UI:
         self._out(
             Panel(
                 body,
-                title="[brand]حمایت کنید 💚[/]",
+                title="[brand]Support this project[/]",
                 title_align="left",
                 box=box.ROUNDED,
                 border_style="accent",
@@ -351,7 +352,7 @@ class _UI:
             Panel(
                 table,
                 title="[brand]session summary[/]",
-                subtitle="[muted]goodbye 👋[/]",
+                subtitle="[muted]goodbye[/]",
                 title_align="left",
                 box=box.ROUNDED,
                 border_style="accent",
@@ -362,3 +363,47 @@ class _UI:
 
 # Module-level singleton used across the app.
 ui = _UI()
+
+
+def silence_event_loop_noise(loop) -> None:
+    """Stop asyncio from spamming the console with benign teardown tracebacks.
+
+    On Windows the default (proactor) event loop cannot cleanly cancel a pending
+    overlapped operation once we close a socket at end-of-stream. It reports this
+    via ``call_exception_handler`` as::
+
+        Cancelling an overlapped future failed
+        OSError: [WinError 6] The handle is invalid
+        ValueError: eof   (from the relay loop's normal end-of-stream)
+
+    None of this indicates a real problem — it is just a connection closing — but
+    the loop prints a full traceback for every closed tunnel, which is exactly the
+    noise we want gone. This installs a handler that drops those benign events
+    (visible only when ``SNI_DEBUG=1``) while still surfacing anything genuinely
+    unexpected as a single concise line. It changes only how errors are *reported*;
+    the DPI-bypass core is untouched.
+    """
+
+    _BENIGN_MARKERS = (
+        "overlapped",              # "Cancelling an overlapped future failed"
+        "handle is invalid",       # WinError 6
+        "winerror 6",
+        "eof",                     # relay loop's normal end-of-stream ValueError
+        "connection reset",
+        "connection aborted",
+        "broken pipe",
+    )
+
+    def _handler(loop, context):
+        message = context.get("message", "")
+        exc = context.get("exception")
+        blob = f"{message} {exc!r}".lower()
+        if any(marker in blob for marker in _BENIGN_MARKERS):
+            ui.debug("asyncio teardown (benign)", detail=message or repr(exc))
+            return
+        if DEBUG:
+            loop.default_exception_handler(context)
+        else:
+            ui.error("internal event-loop error", detail=message or repr(exc))
+
+    loop.set_exception_handler(_handler)

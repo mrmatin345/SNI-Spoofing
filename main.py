@@ -9,7 +9,7 @@ import json
 # from utils.proxy_protocols import parse_vless_protocol
 from utils.network_tools import get_default_interface_ipv4
 from utils.packet_templates import ClientHelloMaker
-from utils.console import ui
+from utils.console import ui, silence_event_loop_noise
 from fake_tcp import FakeInjectiveConnection, FakeTcpInjector
 
 # Buffer size used for socket reads. Slightly above the 65535 max TCP payload
@@ -216,6 +216,9 @@ async def main():
     set_tcp_keepalive(mother_sock)
     mother_sock.listen()
     loop = asyncio.get_running_loop()
+    # Keep the console clean: silence the proactor loop's benign teardown
+    # tracebacks (see silence_event_loop_noise). Presentation only.
+    silence_event_loop_noise(loop)
     ui.online(
         LISTEN_HOST, LISTEN_PORT, CONNECT_IP, CONNECT_PORT,
         FAKE_SNI.decode(), INTERFACE_IPV4, BYPASS_METHOD, DATA_MODE,
